@@ -50,9 +50,21 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     var dev = app.devicesLowLevel() orelse return r4os.abi.err_no_group;
     var files = app.files() orelse return r4os.abi.err_no_fn;
     const data_letter = parseDataDrive(app.args());
+    const pagecache_only = containsIgnoreCase(app.args(), "/PAGECACHE");
     var ok = true;
 
     ctx.println("FSDIAG");
+    if (pagecache_only) {
+        ctx.println("FSDIAG mode: pagecache");
+        ok = checkStorageOwnership(&ctx, &dev, 'C') and ok;
+        ok = checkStorageOwnership(&ctx, &dev, data_letter) and ok;
+        ok = checkDataDrive(&ctx, data_letter) and ok;
+        ok = checkLargeStreaming(&ctx, &dev) and ok;
+        ctx.print("FSDIAG result: ");
+        ctx.println(if (ok) "OK" else "FAILED");
+        return if (ok) 0 else 1;
+    }
+
     ok = checkStorageOwnership(&ctx, &dev, 'C') and ok;
     ok = checkStorageOwnership(&ctx, &dev, data_letter) and ok;
     ok = checkExists(&ctx, "C:\\AUTOEXEC.BAT") and ok;
@@ -601,10 +613,6 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
         ctx.println("FSDIAG stream large result: FAILED missing group-table fn");
         return false;
     }
-    if (!dev.hasFn("performance_summary")) {
-        ctx.println("FSDIAG stream large result: FAILED missing group-table fn");
-        return false;
-    }
 
     _ = ctx.fileDelete(stream_large_path);
     _ = ctx.fileDelete(stream_interleave_path);
@@ -624,8 +632,9 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
     var expected_checksum: u32 = 0;
     var offset_guard_checked = false;
     var offset_guard_ok = false;
-    while (writer.offset < stream_large_bytes) {
-        const want: usize = @intCast(@min(@as(u64, chunk.len), stream_large_bytes - writer.offset));
+    const autonomous_prefix_bytes = stream_large_bytes - stream_large_chunk;
+    while (writer.offset < autonomous_prefix_bytes) {
+        const want: usize = @intCast(@min(@as(u64, chunk.len), autonomous_prefix_bytes - writer.offset));
         fillStreamPattern(chunk[0..want], writer.offset);
         expected_checksum = checksumUpdate(expected_checksum, chunk[0..want]);
         if (!r4os.file_stream.write(ctx, &writer, chunk[0..want])) {
@@ -640,6 +649,44 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
             offset_guard_ok = wrong_offset_rc == r4os.abi.file_stream_error_offset_mismatch;
             offset_guard_checked = true;
         }
+    }
+
+    // Sleeping one tick turns the already signalled pressure threshold into
+    // a deterministic scheduling opportunity without waiting for the age
+    // limit. The remaining final chunk is written only after this snapshot,
+    // so the selective-commit probe still owns fresh foreign dirty sectors.
+    ctx.sleepTicks(1);
+    const after_autonomous = dev.performanceSummary();
+    var policy_contract_ok = false;
+    var autonomous_progress_ok = false;
+    var background_drain_delta: u64 = 0;
+    var background_sector_delta: u64 = 0;
+    if (before) |initial_summary| {
+        if (after_autonomous) |progress_summary| {
+            background_drain_delta = delta(progress_summary.fs_cache_policy_background_drains, initial_summary.fs_cache_policy_background_drains);
+            background_sector_delta = delta(progress_summary.fs_cache_policy_background_sectors, initial_summary.fs_cache_policy_background_sectors);
+            policy_contract_ok = progress_summary.fs_cache_policy_version == 1 and
+                progress_summary.fs_cache_policy_worker_started == 1 and
+                progress_summary.fs_cache_policy_worker_task_id != 0 and
+                progress_summary.fs_cache_policy_dirty_low_pages > 0 and
+                progress_summary.fs_cache_policy_dirty_high_pages > progress_summary.fs_cache_policy_dirty_low_pages and
+                progress_summary.fs_cache_policy_background_page_budget > 0 and
+                progress_summary.fs_cache_policy_background_page_budget <= progress_summary.fs_cache_policy_dirty_low_pages and
+                progress_summary.fs_cache_policy_background_errors == initial_summary.fs_cache_policy_background_errors and
+                progress_summary.fs_cache_policy_full_scan_fallbacks == initial_summary.fs_cache_policy_full_scan_fallbacks;
+            autonomous_progress_ok = background_drain_delta > 0 and background_sector_delta > 0;
+        }
+    }
+
+    const final_want: usize = @intCast(stream_large_bytes - writer.offset);
+    fillStreamPattern(chunk[0..final_want], writer.offset);
+    expected_checksum = checksumUpdate(expected_checksum, chunk[0..final_want]);
+    if (!r4os.file_stream.write(ctx, &writer, chunk[0..final_want])) {
+        ctx.write("FSDIAG stream large result: FAILED final write rc=");
+        ctx.printI32(writer.error_code);
+        ctx.println("");
+        _ = r4os.file_stream.abort(ctx, &writer);
+        return false;
     }
 
     // Keep the large stream's FAT metadata dirty, then commit an unrelated
@@ -727,7 +774,14 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
     _ = ctx.fileDelete(stream_large_path);
     _ = ctx.fileDelete(stream_interleave_path);
     const abort_ok = checkStreamAbort(ctx, chunk[0..]);
-    const ok = offset_guard_ok and finish_guard_ok and checksum_ok and abort_ok and metrics_ok and selective_commit_ok;
+    const ok = offset_guard_ok and
+        finish_guard_ok and
+        checksum_ok and
+        abort_ok and
+        metrics_ok and
+        selective_commit_ok and
+        policy_contract_ok and
+        autonomous_progress_ok;
 
     ctx.write("FSDIAG stream large result: ");
     ctx.write(if (ok) "OK" else "FAILED");
@@ -755,6 +809,8 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
     ctx.write(if (batching_ok) "yes" else "no");
     ctx.write(" selective=");
     ctx.write(if (selective_commit_ok) "yes" else "no");
+    ctx.write(" autonomous=");
+    ctx.write(if (autonomous_progress_ok) "yes" else "no");
     ctx.println("");
 
     ctx.write("FSDIAG selective durability: ");
@@ -765,6 +821,14 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
     ctx.printU64(selective_writeback_delta);
     ctx.write(" foreignSkipped=");
     ctx.printU64(foreign_skip_delta);
+    ctx.println("");
+
+    ctx.write("FSDIAG pagecache policy: ");
+    ctx.write(if (policy_contract_ok and autonomous_progress_ok) "OK" else "FAILED");
+    ctx.write(" drains=");
+    ctx.printU64(background_drain_delta);
+    ctx.write(" sectors=");
+    ctx.printU64(background_sector_delta);
     ctx.println("");
 
     if (before) |before_summary| {
