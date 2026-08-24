@@ -8,6 +8,8 @@ FSDIAG prueft den aktuellen R4SYS-Dateisystemvertrag:
 - positionierte und gestreamte I/O-Pfade
 - Offset-, Groessen-, Abschluss- und Abbruchregeln
 - Cache-, Writeback- und Fehlerdiagnose
+- operationslokaler FAT32-Commit bei gleichzeitig fremden deferred Dirty-
+  Sektoren auf demselben Blockgeraet
 
 Der Test verwendet die aktuellen R4SYS-Felder und faellt nicht auf einen
 zweiten Datei-I/O-Pfad zurueck.

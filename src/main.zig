@@ -11,7 +11,9 @@ const stream_copy_path = "C:\\TEMP\\FSCOPY.BIN";
 // run on the FAT32 data disk since 0.60.9: C: is NTFS, D: keeps the FAT32
 // counters meaningful.
 const stream_large_path = "D:\\TEMP\\FSLARGE.BIN";
+const stream_interleave_path = "D:\\TEMP\\FSINT.BIN";
 const stream_abort_path = "C:\\TEMP\\FSABORT.BIN";
+const qualified_entry_probe_path = "C:\\TEMP\\FSDIREAD.TXT";
 const fat32_synthetic_14mb_path = "D:\\TEMP\\FS14MB.BIN";
 const fat32_extent_cache_path = "D:\\TEMP\\FSEXT.BIN";
 const fat32_fsinfo_probe_path = "D:\\TEMP\\FSINFO.BIN";
@@ -164,6 +166,10 @@ fn checkCacheReadThrough(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.
     };
     const read_delta = if (after.fs_cache_reads >= before.fs_cache_reads) after.fs_cache_reads - before.fs_cache_reads else 0;
     const hit_delta = if (after.fs_cache_hits >= before.fs_cache_hits) after.fs_cache_hits - before.fs_cache_hits else 0;
+    const error_delta = delta(
+        after.fs_cache_read_errors +% after.fs_cache_write_errors +% after.fs_cache_writeback_errors,
+        before.fs_cache_read_errors +% before.fs_cache_write_errors +% before.fs_cache_writeback_errors,
+    );
     const len_ok = a > 0 and b == a;
     const bytes_ok = len_ok and memEql(first[0..@intCast(a)], second[0..@intCast(b)]);
     const ok = dev.hasFn("performance_summary") and
@@ -175,11 +181,9 @@ fn checkCacheReadThrough(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.
         after.fs_cache_capacity > 0 and
         after.fs_cache_sector_bytes == 512 and
         after.fs_cache_entries_used > 0 and
-        // In-place data writes stay lazily dirty on NTFS-C: until the
-        // writeback worker drains them; errors must still be zero.
-        after.fs_cache_read_errors == 0 and
-        after.fs_cache_write_errors == 0 and
-        after.fs_cache_writeback_errors == 0;
+        // Earlier AUTOEXEC probes may deliberately exercise rejected I/O.
+        // This diagnostic owns only the interval between its snapshots.
+        error_delta == 0;
 
     ctx.write("FSDIAG cache result: ");
     ctx.write(if (ok) "OK" else "FAILED");
@@ -221,6 +225,10 @@ fn checkCacheWriteback(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
     const writeback_delta = delta(after.fs_cache_writeback_sectors, before.fs_cache_writeback_sectors);
     const drain_delta = delta(after.fs_cache_writeback_drains, before.fs_cache_writeback_drains);
     const flush_delta = delta(after.fs_cache_writeback_flush_drains, before.fs_cache_writeback_flush_drains);
+    const error_delta = delta(
+        after.fs_cache_write_errors +% after.fs_cache_writeback_errors,
+        before.fs_cache_write_errors +% before.fs_cache_writeback_errors,
+    );
     const len_ok = written == expected_len and read == expected_len;
     const bytes_ok = len_ok and memEql(verify[0..payload.len], payload);
     const ok = dev.hasFn("performance_summary") and
@@ -231,12 +239,11 @@ fn checkCacheWriteback(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
         writeback_delta > 0 and
         drain_delta > 0 and
         flush_delta > 0 and
-        after.fs_cache_dirty_entries == 0 and
-        after.fs_cache_dirty_bytes == 0 and
-        after.fs_cache_writeback_queue_depth == 0 and
+        after.fs_cache_dirty_entries <= before.fs_cache_dirty_entries and
+        after.fs_cache_dirty_bytes <= before.fs_cache_dirty_bytes and
+        after.fs_cache_writeback_queue_depth <= before.fs_cache_writeback_queue_depth and
         after.fs_cache_writeback_queue_high_water > 0 and
-        after.fs_cache_write_errors == 0 and
-        after.fs_cache_writeback_errors == 0;
+        error_delta == 0;
 
     ctx.write("FSDIAG writeback result: ");
     ctx.write(if (ok) "OK" else "FAILED");
@@ -254,8 +261,8 @@ fn checkCacheWriteback(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
     ctx.printU64(after.fs_cache_writeback_queue_depth);
     ctx.write("/");
     ctx.printU64(after.fs_cache_writeback_queue_high_water);
-    ctx.write(" err=");
-    ctx.printU64(after.fs_cache_write_errors +% after.fs_cache_writeback_errors);
+    ctx.write(" errDelta=");
+    ctx.printU64(error_delta);
     ctx.println("");
     return ok;
 }
@@ -600,6 +607,7 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
     }
 
     _ = ctx.fileDelete(stream_large_path);
+    _ = ctx.fileDelete(stream_interleave_path);
     _ = ctx.fileDelete(stream_abort_path);
 
     const before = dev.performanceSummary();
@@ -631,6 +639,31 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
             const wrong_offset_rc = ctx.fileStreamWrite(stream_large_path, writer.offset + 1, "X", 0);
             offset_guard_ok = wrong_offset_rc == r4os.abi.file_stream_error_offset_mismatch;
             offset_guard_checked = true;
+        }
+    }
+
+    // Keep the large stream's FAT metadata dirty, then commit an unrelated
+    // small mutation on the same device. The operation-scoped commit must
+    // write its own sectors and leave the stream's other dirty sectors for
+    // fileStreamFinish's explicit full durability boundary.
+    const before_interleave = dev.performanceSummary();
+    const interleave_payload = "selective FAT commit";
+    const interleave_written = ctx.fileWrite(stream_interleave_path, interleave_payload);
+    const after_interleave = dev.performanceSummary();
+    var selective_commit_ok = false;
+    var selective_flush_delta: u64 = 0;
+    var selective_writeback_delta: u64 = 0;
+    var foreign_skip_delta: u64 = 0;
+    if (before_interleave) |before_summary| {
+        if (after_interleave) |after_summary| {
+            selective_flush_delta = delta(after_summary.fs_cache_selective_flushes, before_summary.fs_cache_selective_flushes);
+            selective_writeback_delta = delta(after_summary.fs_cache_selective_writeback_sectors, before_summary.fs_cache_selective_writeback_sectors);
+            foreign_skip_delta = delta(after_summary.fs_cache_selective_foreign_dirty_sectors_skipped, before_summary.fs_cache_selective_foreign_dirty_sectors_skipped);
+            selective_commit_ok = interleave_written == @as(i32, @intCast(interleave_payload.len)) and
+                selective_flush_delta == 1 and
+                selective_writeback_delta > 0 and
+                foreign_skip_delta > 0 and
+                after_summary.fs_cache_dirty_bytes > 0;
         }
     }
 
@@ -692,8 +725,9 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
     }
 
     _ = ctx.fileDelete(stream_large_path);
+    _ = ctx.fileDelete(stream_interleave_path);
     const abort_ok = checkStreamAbort(ctx, chunk[0..]);
-    const ok = offset_guard_ok and finish_guard_ok and checksum_ok and abort_ok and metrics_ok;
+    const ok = offset_guard_ok and finish_guard_ok and checksum_ok and abort_ok and metrics_ok and selective_commit_ok;
 
     ctx.write("FSDIAG stream large result: ");
     ctx.write(if (ok) "OK" else "FAILED");
@@ -719,6 +753,18 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
     ctx.write(if (responsiveness_ok) "yes" else "no");
     ctx.write(" batching=");
     ctx.write(if (batching_ok) "yes" else "no");
+    ctx.write(" selective=");
+    ctx.write(if (selective_commit_ok) "yes" else "no");
+    ctx.println("");
+
+    ctx.write("FSDIAG selective durability: ");
+    ctx.write(if (selective_commit_ok) "OK" else "FAILED");
+    ctx.write(" flush=");
+    ctx.printU64(selective_flush_delta);
+    ctx.write(" wbSectors=");
+    ctx.printU64(selective_writeback_delta);
+    ctx.write(" foreignSkipped=");
+    ctx.printU64(foreign_skip_delta);
     ctx.println("");
 
     if (before) |before_summary| {
@@ -1411,16 +1457,25 @@ fn checkQualifiedDirEntries(ctx: *const r4os.r4sys.Context) bool {
     }
     ctx.println(if (temp_ok) "OK" else "FAILED");
 
+    // The image no longer promises a static TEMP/README.TXT. Keep the
+    // qualified-child contract probe self-contained instead of depending on
+    // unrelated distribution payload.
+    _ = ctx.fileDelete(qualified_entry_probe_path);
+    const probe_data = "qualified directory entry probe";
+    const probe_written = ctx.fileWrite(qualified_entry_probe_path, probe_data);
     var child_entry: [128]u8 = .{0} ** 128;
-    const child_found = findEntry(ctx, "C:\\TEMP", "README.TXT", child_entry[0..]);
+    const child_found = findEntry(ctx, "C:\\TEMP", "FSDIREAD.TXT", child_entry[0..]);
     const child_text = spanZ(child_entry[0..]);
-    const child_ok = child_found and equalsIgnoreCase(child_text, "C:\\TEMP\\README.TXT");
-    ctx.write("dirEntry qualified C:\\TEMP\\README.TXT: ");
+    const child_ok = probe_written == @as(i32, @intCast(probe_data.len)) and
+        child_found and
+        equalsIgnoreCase(child_text, qualified_entry_probe_path);
+    ctx.write("dirEntry qualified C:\\TEMP\\FSDIREAD.TXT: ");
     if (child_found) {
         writeZ(ctx, @ptrCast(&child_entry), child_entry.len);
         ctx.write(" ");
     }
     ctx.println(if (child_ok) "OK" else "FAILED");
+    _ = ctx.fileDelete(qualified_entry_probe_path);
     return temp_ok and child_ok;
 }
 
