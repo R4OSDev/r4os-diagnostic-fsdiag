@@ -12,14 +12,17 @@ FSDIAG prueft den aktuellen R4SYS-Dateisystemvertrag:
   Sektoren auf demselben Blockgeraet
 - autonomer alters- beziehungsweise druckgebundener Pagecache-Fortschritt
   vor dem expliziten Stream-Durabilityabschluss
+- kalte und warme NTFS-Metadatenaufloesung fuer Record-, Attribut-/Runlist-,
+  INDX- sowie positive und negative Pfadcaches mit Mutationsinvalidierung
 
 Der Test verwendet die aktuellen R4SYS-Felder und faellt nicht auf einen
 zweiten Datei-I/O-Pfad zurueck.
 
-`FSDIAG /PAGECACHE` fuehrt nur die bestehende 1-MB-Stream-, selektive
-Commit-, Readback-, Abbruch- und Pagecache-Policyprobe aus. Das Testprofil
-nutzt diesen begrenzten Modus als Gastgate; ein normaler Aufruf behaelt die
-vollstaendige Dateisystemdiagnose einschliesslich der grossen FAT32-Proben.
+`FSDIAG /PAGECACHE` fuehrt die NTFS-Metadatencacheprobe sowie die bestehende
+1-MB-Stream-, selektive Commit-, Readback-, Abbruch- und
+Pagecache-Policyprobe aus. Das Testprofil nutzt diesen begrenzten Modus als
+Gastgate; ein normaler Aufruf behaelt die vollstaendige Dateisystemdiagnose
+einschliesslich der grossen FAT32-Proben.
 
 Repository-Build
 ----------------

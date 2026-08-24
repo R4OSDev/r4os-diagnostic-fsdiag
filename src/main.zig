@@ -14,6 +14,9 @@ const stream_large_path = "D:\\TEMP\\FSLARGE.BIN";
 const stream_interleave_path = "D:\\TEMP\\FSINT.BIN";
 const stream_abort_path = "C:\\TEMP\\FSABORT.BIN";
 const qualified_entry_probe_path = "C:\\TEMP\\FSDIREAD.TXT";
+const ntfs_metadata_probe_path = "C:\\TEMP\\NTFSMETA.TST";
+const ntfs_metadata_reset_path = "C:\\TEMP\\NTFSRST.TST";
+const ntfs_metadata_probe_data = "R4OS NTFS metadata cache probe\r\n";
 const fat32_synthetic_14mb_path = "D:\\TEMP\\FS14MB.BIN";
 const fat32_extent_cache_path = "D:\\TEMP\\FSEXT.BIN";
 const fat32_fsinfo_probe_path = "D:\\TEMP\\FSINFO.BIN";
@@ -59,6 +62,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         ok = checkStorageOwnership(&ctx, &dev, 'C') and ok;
         ok = checkStorageOwnership(&ctx, &dev, data_letter) and ok;
         ok = checkDataDrive(&ctx, data_letter) and ok;
+        ok = checkNtfsMetadataCache(&ctx, &dev) and ok;
         ok = checkLargeStreaming(&ctx, &dev) and ok;
         ctx.print("FSDIAG result: ");
         ctx.println(if (ok) "OK" else "FAILED");
@@ -69,6 +73,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     ok = checkStorageOwnership(&ctx, &dev, data_letter) and ok;
     ok = checkExists(&ctx, "C:\\AUTOEXEC.BAT") and ok;
     ok = checkDataDrive(&ctx, data_letter) and ok;
+    ok = checkNtfsMetadataCache(&ctx, &dev) and ok;
     ok = checkReadConfig(&ctx) and ok;
     ok = checkFacadeRead(&ctx, &files) and ok;
     ok = checkCacheReadThrough(&ctx, &dev) and ok;
@@ -215,6 +220,176 @@ fn checkCacheReadThrough(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.
     ctx.printU64(after.fs_cache_capacity);
     ctx.write(" dirty=");
     ctx.printU64(after.fs_cache_dirty_entries);
+    ctx.println("");
+    return ok;
+}
+
+fn checkNtfsMetadataCache(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Context) bool {
+    if (!dev.hasFn("performance_summary")) {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED performance unavailable");
+        return false;
+    }
+
+    // Leave the probe name absent and invalidate any negative result created
+    // by cleanup through a separate, guaranteed mutation.
+    _ = ctx.fileDelete(ntfs_metadata_probe_path);
+    const reset_written = ctx.fileWrite(ntfs_metadata_reset_path, "reset");
+    const reset_deleted = ctx.fileDelete(ntfs_metadata_reset_path);
+    if (reset_written != 5 or reset_deleted <= 0) {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED setup");
+        return false;
+    }
+
+    const before = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED initial snapshot");
+        return false;
+    };
+    const capacity_sum = before.ntfs_metadata_record_capacity +
+        before.ntfs_metadata_attribute_capacity +
+        before.ntfs_metadata_index_capacity +
+        before.ntfs_metadata_path_capacity;
+    const active_volumes: u64 = before.ntfs_metadata_cache_active_volumes;
+    const capacities_ok = before.version >= 12 and
+        before.ntfs_metadata_cache_version == 1 and
+        before.ntfs_metadata_cache_active_volumes > 0 and
+        before.ntfs_metadata_cache_slot_capacity == capacity_sum and
+        before.ntfs_metadata_cache_slot_capacity == 22 and
+        before.ntfs_metadata_cache_bytes_per_volume > 0 and
+        before.ntfs_metadata_record_entries <= active_volumes * before.ntfs_metadata_record_capacity and
+        before.ntfs_metadata_attribute_entries <= active_volumes * before.ntfs_metadata_attribute_capacity and
+        before.ntfs_metadata_index_entries <= active_volumes * before.ntfs_metadata_index_capacity and
+        before.ntfs_metadata_path_entries <= active_volumes * before.ntfs_metadata_path_capacity and
+        before.ntfs_metadata_mount_generation > 0 and
+        before.ntfs_metadata_content_generation > 0 and
+        before.ntfs_metadata_negative_ttl_ticks > 0;
+
+    const first_missing = ctx.fileInfo(ntfs_metadata_probe_path) == null;
+    const cold_missing = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED cold-negative snapshot");
+        return false;
+    };
+    const second_missing = ctx.fileInfo(ntfs_metadata_probe_path) == null;
+    const warm_missing = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED warm-negative snapshot");
+        return false;
+    };
+    const cold_negative_ok = first_missing and
+        delta(cold_missing.ntfs_metadata_path_misses, before.ntfs_metadata_path_misses) > 0 and
+        delta(cold_missing.ntfs_metadata_lookup_tree_walks, before.ntfs_metadata_lookup_tree_walks) > 0;
+    const warm_negative_ok = second_missing and
+        delta(warm_missing.ntfs_metadata_path_negative_hits, cold_missing.ntfs_metadata_path_negative_hits) > 0 and
+        delta(warm_missing.ntfs_metadata_lookup_tree_walks, cold_missing.ntfs_metadata_lookup_tree_walks) == 0;
+
+    const written = ctx.fileWrite(ntfs_metadata_probe_path, ntfs_metadata_probe_data);
+    const after_write = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED post-create snapshot");
+        return false;
+    };
+    const first_info = ctx.fileInfo(ntfs_metadata_probe_path);
+    const cold_positive = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED cold-positive snapshot");
+        return false;
+    };
+    const second_info = ctx.fileInfo(ntfs_metadata_probe_path);
+    const warm_positive = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED warm-positive snapshot");
+        return false;
+    };
+    const expected_len: i32 = @intCast(ntfs_metadata_probe_data.len);
+    const positive_sizes_ok = first_info != null and second_info != null and
+        first_info.?.size == ntfs_metadata_probe_data.len and
+        second_info.?.size == ntfs_metadata_probe_data.len;
+    const cold_positive_ok = written == expected_len and positive_sizes_ok and
+        delta(cold_positive.ntfs_metadata_path_misses, after_write.ntfs_metadata_path_misses) > 0 and
+        delta(cold_positive.ntfs_metadata_lookup_tree_walks, after_write.ntfs_metadata_lookup_tree_walks) > 0;
+    const warm_positive_ok =
+        delta(warm_positive.ntfs_metadata_path_positive_hits, cold_positive.ntfs_metadata_path_positive_hits) > 0 and
+        delta(warm_positive.ntfs_metadata_attribute_hits, cold_positive.ntfs_metadata_attribute_hits) > 0 and
+        delta(warm_positive.ntfs_metadata_lookup_tree_walks, cold_positive.ntfs_metadata_lookup_tree_walks) == 0;
+
+    const deleted = ctx.fileDelete(ntfs_metadata_probe_path);
+    const after_delete = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED post-delete snapshot");
+        return false;
+    };
+    const missing_after_delete = ctx.fileInfo(ntfs_metadata_probe_path) == null;
+    const cold_after_delete = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED delete-cold snapshot");
+        return false;
+    };
+    const missing_after_delete_warm = ctx.fileInfo(ntfs_metadata_probe_path) == null;
+    const warm_after_delete = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED delete-warm snapshot");
+        return false;
+    };
+    const delete_invalidation_ok = deleted > 0 and
+        delta(after_delete.ntfs_metadata_mutation_invalidations, warm_positive.ntfs_metadata_mutation_invalidations) > 0 and
+        after_delete.ntfs_metadata_content_generation > warm_positive.ntfs_metadata_content_generation and
+        missing_after_delete and
+        delta(cold_after_delete.ntfs_metadata_path_misses, after_delete.ntfs_metadata_path_misses) > 0 and
+        delta(cold_after_delete.ntfs_metadata_lookup_tree_walks, after_delete.ntfs_metadata_lookup_tree_walks) > 0 and
+        missing_after_delete_warm and
+        delta(warm_after_delete.ntfs_metadata_path_negative_hits, cold_after_delete.ntfs_metadata_path_negative_hits) > 0 and
+        delta(warm_after_delete.ntfs_metadata_lookup_tree_walks, cold_after_delete.ntfs_metadata_lookup_tree_walks) == 0;
+    const create_invalidation_ok =
+        delta(after_write.ntfs_metadata_mutation_invalidations, warm_missing.ntfs_metadata_mutation_invalidations) > 0 and
+        after_write.ntfs_metadata_content_generation > warm_missing.ntfs_metadata_content_generation;
+
+    // CONFIG is large enough to own an INDX allocation in the test image.
+    // A second unchanged enumeration must therefore reuse a decoded block.
+    var index_entry: [128]u8 = .{0} ** 128;
+    const index_cold_rc = ctx.dirEntry("C:\\R4OS\\CONFIG", 6, index_entry[0..]);
+    const index_cold = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED index-cold snapshot");
+        return false;
+    };
+    @memset(index_entry[0..], 0);
+    const index_warm_rc = ctx.dirEntry("C:\\R4OS\\CONFIG", 6, index_entry[0..]);
+    const after = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED final snapshot");
+        return false;
+    };
+    const index_warm_hits = delta(after.ntfs_metadata_index_hits, index_cold.ntfs_metadata_index_hits);
+    const index_ok = index_cold_rc >= 0 and index_warm_rc >= 0 and index_warm_hits > 0;
+    const record_ok = delta(after.ntfs_metadata_record_hits, before.ntfs_metadata_record_hits) > 0;
+
+    const ok = capacities_ok and cold_negative_ok and warm_negative_ok and
+        create_invalidation_ok and cold_positive_ok and warm_positive_ok and
+        delete_invalidation_ok and index_ok and record_ok;
+    ctx.write("FSDIAG ntfs metadata cache: ");
+    ctx.write(if (ok) "OK" else "FAILED");
+    ctx.write(" coldMiss=");
+    ctx.printU64(delta(cold_missing.ntfs_metadata_path_misses, before.ntfs_metadata_path_misses));
+    ctx.write(" warmNeg=");
+    ctx.printU64(delta(warm_missing.ntfs_metadata_path_negative_hits, cold_missing.ntfs_metadata_path_negative_hits));
+    ctx.write(" warmPos=");
+    ctx.printU64(delta(warm_positive.ntfs_metadata_path_positive_hits, cold_positive.ntfs_metadata_path_positive_hits));
+    ctx.write(" recordHit=");
+    ctx.printU64(delta(after.ntfs_metadata_record_hits, before.ntfs_metadata_record_hits));
+    ctx.write(" attrHit=");
+    ctx.printU64(delta(warm_positive.ntfs_metadata_attribute_hits, cold_positive.ntfs_metadata_attribute_hits));
+    ctx.write(" indexHit=");
+    ctx.printU64(index_warm_hits);
+    ctx.write(" invalidation=");
+    ctx.printU64(delta(after.ntfs_metadata_mutation_invalidations, before.ntfs_metadata_mutation_invalidations));
+    ctx.write(" generation=");
+    ctx.printU64(before.ntfs_metadata_content_generation);
+    ctx.write("->");
+    ctx.printU64(after.ntfs_metadata_content_generation);
+    ctx.write(" checks=");
+    ctx.write(if (capacities_ok) "C" else "c");
+    ctx.write(if (cold_negative_ok) "N" else "n");
+    ctx.write(if (warm_negative_ok) "W" else "w");
+    ctx.write(if (create_invalidation_ok) "I" else "i");
+    ctx.write(if (cold_positive_ok) "P" else "p");
+    ctx.write(if (warm_positive_ok) "H" else "h");
+    ctx.write(if (delete_invalidation_ok) "D" else "d");
+    ctx.write(if (index_ok) "X" else "x");
+    ctx.write(if (record_ok) "R" else "r");
+    ctx.write(" bytes=");
+    ctx.printU64(before.ntfs_metadata_cache_bytes_per_volume);
+    ctx.write(" slots=");
+    ctx.printU64(before.ntfs_metadata_cache_slot_capacity);
     ctx.println("");
     return ok;
 }
