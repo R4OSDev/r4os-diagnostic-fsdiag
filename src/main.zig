@@ -11,6 +11,7 @@ const stream_copy_path = "C:\\TEMP\\FSCOPY.BIN";
 // run on the FAT32 data disk since 0.60.9: C: is NTFS, D: keeps the FAT32
 // counters meaningful.
 const stream_large_path = "D:\\TEMP\\FSLARGE.BIN";
+const pagecache_multifill_probe_path = "C:\\R4OS\\SUBSYSTEMS\\r4os.snes\\R4SNES.R4X";
 const stream_interleave_path = "D:\\TEMP\\FSINT.BIN";
 const stream_abort_path = "C:\\TEMP\\FSABORT.BIN";
 const qualified_entry_probe_path = "C:\\TEMP\\FSDIREAD.TXT";
@@ -38,6 +39,7 @@ const stream_write_chunk: usize = 2 * 1024;
 const stream_copy_chunk: usize = 1024;
 const stream_large_bytes: u64 = 1024 * 1024;
 const stream_large_chunk: usize = 8 * 1024;
+const pagecache_multifill_probe_bytes: u64 = 1024 * 1024;
 const stream_large_max_flushes: u64 = 4;
 const fat32_synthetic_14mb_bytes: u64 = 14 * 1024 * 1024;
 const fat32_synthetic_14mb_chunk: usize = 8 * 1024;
@@ -840,13 +842,24 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
         if (after_autonomous) |progress_summary| {
             background_drain_delta = delta(progress_summary.fs_cache_policy_background_drains, initial_summary.fs_cache_policy_background_drains);
             background_sector_delta = delta(progress_summary.fs_cache_policy_background_sectors, initial_summary.fs_cache_policy_background_sectors);
-            policy_contract_ok = progress_summary.fs_cache_policy_version == 1 and
+            policy_contract_ok = progress_summary.fs_cache_policy_version == 2 and
                 progress_summary.fs_cache_policy_worker_started == 1 and
                 progress_summary.fs_cache_policy_worker_task_id != 0 and
                 progress_summary.fs_cache_policy_dirty_low_pages > 0 and
                 progress_summary.fs_cache_policy_dirty_high_pages > progress_summary.fs_cache_policy_dirty_low_pages and
                 progress_summary.fs_cache_policy_background_page_budget > 0 and
                 progress_summary.fs_cache_policy_background_page_budget <= progress_summary.fs_cache_policy_dirty_low_pages and
+                progress_summary.fs_cache_capacity_min_pages == 64 and
+                progress_summary.fs_cache_capacity_max_pages == 512 and
+                progress_summary.fs_cache_capacity_ram_limit_pages >= progress_summary.fs_cache_capacity_min_pages and
+                progress_summary.fs_cache_capacity_ram_limit_pages <= progress_summary.fs_cache_capacity_max_pages and
+                progress_summary.fs_cache_capacity_active_limit_pages >= progress_summary.fs_cache_capacity_min_pages and
+                progress_summary.fs_cache_capacity_active_limit_pages <= progress_summary.fs_cache_capacity_ram_limit_pages and
+                progress_summary.fs_cache_capacity_pressure_level <= 3 and
+                progress_summary.fs_cache_read_ahead_window_pages == 0 and
+                progress_summary.fs_cache_read_ahead_window_max_pages == 0 and
+                progress_summary.fs_cache_read_ahead_requests == 0 and
+                progress_summary.fs_cache_read_ahead_issued == 0 and
                 progress_summary.fs_cache_policy_background_errors == initial_summary.fs_cache_policy_background_errors and
                 progress_summary.fs_cache_policy_full_scan_fallbacks == initial_summary.fs_cache_policy_full_scan_fallbacks;
             autonomous_progress_ok = background_drain_delta > 0 and background_sector_delta > 0;
@@ -901,7 +914,82 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
     var read_chunk: [stream_large_chunk]u8 = undefined;
     const read_checksum = checksumFile(ctx, stream_large_path, stream_large_bytes, read_chunk[0..]);
     const checksum_ok = read_checksum != null and read_checksum.? == expected_checksum;
+
+    // Preserve the FAT32 stream-integrity probe, then evict old clean pages
+    // and read a known large NTFS module in 8-KB ranges. FAT32's 512-byte
+    // test-image clusters necessarily reach the cache one sector at a time;
+    // the NTFS range path preserves one contiguous multi-sector request and
+    // therefore exercises the production multi-page fill contract directly.
+    const cold_reclaim = reclaimPageCacheToPolicyFloor(dev);
+    const before_readback = dev.performanceSummary();
+    const probe_checksum = checksumFile(ctx, pagecache_multifill_probe_path, pagecache_multifill_probe_bytes, read_chunk[0..]);
+    const multifill_probe_ok = probe_checksum != null;
     const after_large = dev.performanceSummary();
+
+    var fill_run_requests_delta: u64 = 0;
+    var fill_backend_requests_delta: u64 = 0;
+    var fill_pages_delta: u64 = 0;
+    var fill_sectors_delta: u64 = 0;
+    var fill_bytes_delta: u64 = 0;
+    var fill_failures_delta: u64 = 0;
+    var fill_retries_delta: u64 = 0;
+    var fill_max_pages: u64 = 0;
+    var fill_scatter_bytes_delta: u64 = 0;
+    var read_staging_bytes_delta: u64 = 0;
+    var read_caller_bytes_delta: u64 = 0;
+    var read_publish_locks_delta: u64 = 0;
+    var fill_locks_delta: u64 = 0;
+    var read_errors_delta: u64 = 0;
+    var multi_fill_ok = false;
+    var copy_safety_ok = false;
+    var capacity_ok = false;
+    if (before_readback) |read_before| {
+        if (after_large) |read_after| {
+            fill_run_requests_delta = delta(read_after.fs_cache_fill_run_requests, read_before.fs_cache_fill_run_requests);
+            fill_backend_requests_delta = delta(read_after.fs_cache_fill_run_backend_requests, read_before.fs_cache_fill_run_backend_requests);
+            fill_pages_delta = delta(read_after.fs_cache_fill_run_pages, read_before.fs_cache_fill_run_pages);
+            fill_sectors_delta = delta(read_after.fs_cache_fill_run_sectors, read_before.fs_cache_fill_run_sectors);
+            fill_bytes_delta = delta(read_after.fs_cache_fill_run_bytes, read_before.fs_cache_fill_run_bytes);
+            fill_failures_delta = delta(read_after.fs_cache_fill_run_failures, read_before.fs_cache_fill_run_failures);
+            fill_retries_delta = delta(read_after.fs_cache_fill_run_retries, read_before.fs_cache_fill_run_retries);
+            fill_max_pages = read_after.fs_cache_fill_run_max_pages;
+            fill_scatter_bytes_delta = delta(read_after.fs_cache_fill_scatter_copy_bytes, read_before.fs_cache_fill_scatter_copy_bytes);
+            read_staging_bytes_delta = delta(read_after.fs_cache_read_staging_copy_bytes, read_before.fs_cache_read_staging_copy_bytes);
+            read_caller_bytes_delta = delta(read_after.fs_cache_read_caller_copy_bytes, read_before.fs_cache_read_caller_copy_bytes);
+            read_publish_locks_delta = delta(read_after.fs_cache_read_publish_lock_drops, read_before.fs_cache_read_publish_lock_drops);
+            fill_locks_delta = delta(read_after.fs_cache_fill_lock_drops, read_before.fs_cache_fill_lock_drops);
+            read_errors_delta = delta(read_after.fs_cache_read_errors, read_before.fs_cache_read_errors);
+            multi_fill_ok = multifill_probe_ok and
+                fill_run_requests_delta > 0 and
+                fill_backend_requests_delta == fill_run_requests_delta + fill_retries_delta and
+                fill_backend_requests_delta < fill_pages_delta and
+                fill_sectors_delta >= fill_pages_delta and
+                fill_bytes_delta == fill_sectors_delta * 512 and
+                fill_failures_delta == 0 and
+                fill_max_pages == 2 and
+                fill_scatter_bytes_delta > 0 and
+                fill_scatter_bytes_delta <= fill_bytes_delta and
+                fill_locks_delta == fill_run_requests_delta and
+                fill_locks_delta < fill_pages_delta and
+                read_errors_delta == 0;
+            // The second copy remains intentional: the cache lock must be
+            // absent while a potentially pageable caller buffer is written.
+            copy_safety_ok = read_staging_bytes_delta == read_caller_bytes_delta and
+                read_caller_bytes_delta >= pagecache_multifill_probe_bytes and
+                read_publish_locks_delta > 0;
+            capacity_ok = read_after.fs_cache_capacity_min_pages == 64 and
+                read_after.fs_cache_capacity_max_pages == 512 and
+                read_after.fs_cache_capacity_ram_limit_pages >= read_after.fs_cache_capacity_min_pages and
+                read_after.fs_cache_capacity_ram_limit_pages <= read_after.fs_cache_capacity_max_pages and
+                read_after.fs_cache_capacity_active_limit_pages >= read_after.fs_cache_capacity_min_pages and
+                read_after.fs_cache_capacity_active_limit_pages <= read_after.fs_cache_capacity_ram_limit_pages and
+                read_after.fs_cache_capacity_pressure_level <= 3 and
+                read_after.fs_cache_read_ahead_window_pages == 0 and
+                read_after.fs_cache_read_ahead_window_max_pages == 0 and
+                read_after.fs_cache_read_ahead_requests == 0 and
+                read_after.fs_cache_read_ahead_issued == 0;
+        }
+    }
 
     var metrics_ok = false;
     var flush_guard_ok = false;
@@ -956,7 +1044,11 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
         metrics_ok and
         selective_commit_ok and
         policy_contract_ok and
-        autonomous_progress_ok;
+        autonomous_progress_ok and
+        cold_reclaim.ok and
+        multi_fill_ok and
+        copy_safety_ok and
+        capacity_ok;
 
     ctx.write("FSDIAG stream large result: ");
     ctx.write(if (ok) "OK" else "FAILED");
@@ -986,6 +1078,12 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
     ctx.write(if (selective_commit_ok) "yes" else "no");
     ctx.write(" autonomous=");
     ctx.write(if (autonomous_progress_ok) "yes" else "no");
+    ctx.write(" multiFill=");
+    ctx.write(if (multi_fill_ok) "yes" else "no");
+    ctx.write(" ntfsProbe=");
+    ctx.write(if (multifill_probe_ok) "yes" else "no");
+    ctx.write(" copySafe=");
+    ctx.write(if (copy_safety_ok) "yes" else "no");
     ctx.println("");
 
     ctx.write("FSDIAG selective durability: ");
@@ -999,11 +1097,45 @@ fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Co
     ctx.println("");
 
     ctx.write("FSDIAG pagecache policy: ");
-    ctx.write(if (policy_contract_ok and autonomous_progress_ok) "OK" else "FAILED");
+    ctx.write(if (policy_contract_ok and autonomous_progress_ok and cold_reclaim.ok and multi_fill_ok and copy_safety_ok and capacity_ok) "OK" else "FAILED");
     ctx.write(" drains=");
     ctx.printU64(background_drain_delta);
     ctx.write(" sectors=");
     ctx.printU64(background_sector_delta);
+    ctx.write(" fillReq=");
+    ctx.printU64(fill_run_requests_delta);
+    ctx.write("/");
+    ctx.printU64(fill_backend_requests_delta);
+    ctx.write(" pages=");
+    ctx.printU64(fill_pages_delta);
+    ctx.write(" sectors=");
+    ctx.printU64(fill_sectors_delta);
+    ctx.write(" bytes=");
+    ctx.printU64(fill_bytes_delta);
+    ctx.write(" err=");
+    ctx.printU64(fill_failures_delta + read_errors_delta);
+    ctx.write(" retry=");
+    ctx.printU64(fill_retries_delta);
+    ctx.write(" locks=");
+    ctx.printU64(fill_locks_delta);
+    ctx.write("/");
+    ctx.printU64(read_publish_locks_delta);
+    ctx.write(" copy=");
+    ctx.printU64(fill_scatter_bytes_delta);
+    ctx.write("/");
+    ctx.printU64(read_staging_bytes_delta);
+    ctx.write("/");
+    ctx.printU64(read_caller_bytes_delta);
+    ctx.write(" readAhead=");
+    ctx.write(if (capacity_ok) "off" else "invalid");
+    ctx.write(" reclaim=");
+    ctx.printU64(cold_reclaim.passes);
+    ctx.write("/");
+    ctx.printU64(cold_reclaim.fs_frames);
+    ctx.write(" entries=");
+    ctx.printU64(cold_reclaim.entries_before);
+    ctx.write("->");
+    ctx.printU64(cold_reclaim.entries_after);
     ctx.println("");
 
     if (before) |before_summary| {
@@ -1790,6 +1922,43 @@ fn memEql(a: []const u8, b: []const u8) bool {
         if (a[i] != b[i]) return false;
     }
     return true;
+}
+
+const PageCacheColdReclaim = struct {
+    ok: bool = false,
+    passes: u64 = 0,
+    fs_frames: u64 = 0,
+    failed_drains: u64 = 0,
+    entries_before: u64 = 0,
+    entries_after: u64 = 0,
+};
+
+fn reclaimPageCacheToPolicyFloor(dev: *const r4os.r4dev.Context) PageCacheColdReclaim {
+    var result = PageCacheColdReclaim{};
+    var snapshot = dev.performanceSummary() orelse return result;
+    result.entries_before = snapshot.fs_cache_entries_used;
+    result.entries_after = result.entries_before;
+    const floor: u64 = snapshot.fs_cache_capacity_min_pages;
+    const speculation: u64 = snapshot.fs_cache_read_ahead_window_max_pages;
+    if (floor == 0 or floor >= snapshot.fs_cache_capacity_max_pages) return result;
+
+    // A reclaim request is capped at 64 frames by R4DEV. Cached kernel
+    // stacks are reclaimed before filesystem pages, so allow several bounded
+    // passes and use the observed cache residency as the stop condition.
+    while (result.entries_after > floor and result.passes < 32) {
+        const requested: u32 = @intCast(@min(@as(u64, 64), result.entries_after - floor));
+        const probe = dev.memoryReclaimProbe(requested) orelse break;
+        result.passes += 1;
+        result.fs_frames +%= probe.fs_returned_frames;
+        result.failed_drains +%= probe.failed_drains;
+        const next = dev.performanceSummary() orelse break;
+        const previous_entries = result.entries_after;
+        snapshot = next;
+        result.entries_after = snapshot.fs_cache_entries_used;
+        if (result.entries_after >= previous_entries and probe.returned_frames == 0) break;
+    }
+    result.ok = result.failed_drains == 0 and result.entries_after <= floor + speculation;
+    return result;
 }
 
 fn delta(after: u64, before: u64) u64 {

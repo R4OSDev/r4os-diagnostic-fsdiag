@@ -12,6 +12,9 @@ FSDIAG prueft den aktuellen R4SYS-Dateisystemvertrag:
   Sektoren auf demselben Blockgeraet
 - autonomer alters- beziehungsweise druckgebundener Pagecache-Fortschritt
   vor dem expliziten Stream-Durabilityabschluss
+- RAM- und druckbegrenzte Pagecache-Kapazitaet, explizit deaktiviertes
+  spekulatives Read-ahead sowie zusammenhaengende Mehrseiten-Fills mit rohen Backend-,
+  Seiten-, Sektor-, Byte-, Fehler-, Retry-, Kopier- und Lockzaehlern
 - kalte und warme NTFS-Metadatenaufloesung fuer Record-, Attribut-/Runlist-,
   INDX- sowie positive und negative Pfadcaches mit Mutationsinvalidierung
 
@@ -20,9 +23,20 @@ zweiten Datei-I/O-Pfad zurueck.
 
 `FSDIAG /PAGECACHE` fuehrt die NTFS-Metadatencacheprobe sowie die bestehende
 1-MB-Stream-, selektive Commit-, Readback-, Abbruch- und
-Pagecache-Policyprobe aus. Das Testprofil nutzt diesen begrenzten Modus als
-Gastgate; ein normaler Aufruf behaelt die vollstaendige Dateisystemdiagnose
-einschliesslich der grossen FAT32-Proben.
+Pagecache-Policyprobe aus. Nach dem Integritaets-Readback des FAT32-Streams
+wird saubere Cache-Residenz ueber den vorhandenen begrenzten R4DEV-Reclaim-
+Vertrag bis zum Policy-Floor reduziert. Anschliessende 8-KB-Reads aus dem
+installierten grossen R4SNES-Modul pruefen ueber den NTFS-Range-Pfad
+reproduzierbar mehr 4-KB-Seiten als Backendrequests und Fill-Lockabgaben.
+FAT32 besitzt im Testimage 512-Byte-Cluster und kann diesen Mehrseitenbeleg
+daher nicht selbst liefern. Die Diagnose verlangt zugleich die absichtlich
+beibehaltene zweite Kopie: Erst resident aus dem Cache, dann ohne Cachelock in
+den potenziell pageable Caller. Sie verlangt ausserdem Read-ahead-Fenster und
+-Aktivitaet null, weil alle getesteten spekulativen Varianten zusammen mit
+dem Mehrseiten-Demand-Pfad reproduzierbare Subsystemhaenger verursachten. Das
+Testprofil nutzt diesen begrenzten Modus
+als Gastgate; ein normaler Aufruf behaelt die vollstaendige
+Dateisystemdiagnose einschliesslich der grossen FAT32-Proben.
 
 Repository-Build
 ----------------
