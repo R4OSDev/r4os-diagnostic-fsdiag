@@ -16,8 +16,8 @@ const stream_interleave_path = "D:\\TEMP\\FSINT.BIN";
 const stream_abort_path = "C:\\TEMP\\FSABORT.BIN";
 const qualified_entry_probe_path = "C:\\TEMP\\FSDIREAD.TXT";
 const ntfs_metadata_probe_path = "C:\\TEMP\\NTFSMETA.TST";
+const ntfs_metadata_renamed_path = "C:\\TEMP\\NTFSMETA2.TST";
 const ntfs_metadata_reset_path = "C:\\TEMP\\NTFSRST.TST";
-const ntfs_metadata_probe_data = "R4OS NTFS metadata cache probe\r\n";
 const fat32_synthetic_14mb_path = "D:\\TEMP\\FS14MB.BIN";
 const fat32_extent_cache_path = "D:\\TEMP\\FSEXT.BIN";
 const fat32_fsinfo_probe_path = "D:\\TEMP\\FSINFO.BIN";
@@ -235,6 +235,7 @@ fn checkNtfsMetadataCache(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev
     // Leave the probe name absent and invalidate any negative result created
     // by cleanup through a separate, guaranteed mutation.
     _ = ctx.fileDelete(ntfs_metadata_probe_path);
+    _ = ctx.fileDelete(ntfs_metadata_renamed_path);
     const reset_written = ctx.fileWrite(ntfs_metadata_reset_path, "reset");
     const reset_deleted = ctx.fileDelete(ntfs_metadata_reset_path);
     if (reset_written != 5 or reset_deleted <= 0) {
@@ -251,8 +252,8 @@ fn checkNtfsMetadataCache(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev
         before.ntfs_metadata_index_capacity +
         before.ntfs_metadata_path_capacity;
     const active_volumes: u64 = before.ntfs_metadata_cache_active_volumes;
-    const capacities_ok = before.version >= 12 and
-        before.ntfs_metadata_cache_version == 1 and
+    const capacities_ok = before.version >= 14 and
+        before.ntfs_metadata_cache_version == 2 and
         before.ntfs_metadata_cache_active_volumes > 0 and
         before.ntfs_metadata_cache_slot_capacity == capacity_sum and
         before.ntfs_metadata_cache_slot_capacity == 22 and
@@ -263,7 +264,12 @@ fn checkNtfsMetadataCache(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev
         before.ntfs_metadata_path_entries <= active_volumes * before.ntfs_metadata_path_capacity and
         before.ntfs_metadata_mount_generation > 0 and
         before.ntfs_metadata_content_generation > 0 and
-        before.ntfs_metadata_negative_ttl_ticks > 0;
+        before.ntfs_metadata_negative_ttl_ticks > 0 and
+        before.ntfs_metadata_targeted_invalidations ==
+            before.ntfs_metadata_targeted_record_invalidations +%
+                before.ntfs_metadata_targeted_attribute_invalidations +%
+                before.ntfs_metadata_targeted_directory_invalidations and
+        before.ntfs_metadata_global_mutation_invalidations >= before.ntfs_metadata_recovery_invalidations;
 
     const first_missing = ctx.fileInfo(ntfs_metadata_probe_path) == null;
     const cold_missing = dev.performanceSummary() orelse {
@@ -282,7 +288,11 @@ fn checkNtfsMetadataCache(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev
         delta(warm_missing.ntfs_metadata_path_negative_hits, cold_missing.ntfs_metadata_path_negative_hits) > 0 and
         delta(warm_missing.ntfs_metadata_lookup_tree_walks, cold_missing.ntfs_metadata_lookup_tree_walks) == 0;
 
-    const written = ctx.fileWrite(ntfs_metadata_probe_path, ntfs_metadata_probe_data);
+    var initial_data: [2048]u8 = undefined;
+    var append_data_buf: [1024]u8 = undefined;
+    fillStreamPattern(initial_data[0..], 0);
+    fillStreamPattern(append_data_buf[0..], initial_data.len);
+    const written = ctx.fileWrite(ntfs_metadata_probe_path, initial_data[0..]);
     const after_write = dev.performanceSummary() orelse {
         ctx.println("FSDIAG ntfs metadata cache: FAILED post-create snapshot");
         return false;
@@ -297,10 +307,10 @@ fn checkNtfsMetadataCache(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev
         ctx.println("FSDIAG ntfs metadata cache: FAILED warm-positive snapshot");
         return false;
     };
-    const expected_len: i32 = @intCast(ntfs_metadata_probe_data.len);
+    const expected_len: i32 = @intCast(initial_data.len);
     const positive_sizes_ok = first_info != null and second_info != null and
-        first_info.?.size == ntfs_metadata_probe_data.len and
-        second_info.?.size == ntfs_metadata_probe_data.len;
+        first_info.?.size == initial_data.len and
+        second_info.?.size == initial_data.len;
     const cold_positive_ok = written == expected_len and positive_sizes_ok and
         delta(cold_positive.ntfs_metadata_path_misses, after_write.ntfs_metadata_path_misses) > 0 and
         delta(cold_positive.ntfs_metadata_lookup_tree_walks, after_write.ntfs_metadata_lookup_tree_walks) > 0;
@@ -309,34 +319,102 @@ fn checkNtfsMetadataCache(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev
         delta(warm_positive.ntfs_metadata_attribute_hits, cold_positive.ntfs_metadata_attribute_hits) > 0 and
         delta(warm_positive.ntfs_metadata_lookup_tree_walks, cold_positive.ntfs_metadata_lookup_tree_walks) == 0;
 
-    const deleted = ctx.fileDelete(ntfs_metadata_probe_path);
+    const create_invalidation_ok =
+        delta(after_write.ntfs_metadata_payload_write_retentions, warm_missing.ntfs_metadata_payload_write_retentions) > 0 and
+        delta(after_write.ntfs_metadata_system_write_retentions, warm_missing.ntfs_metadata_system_write_retentions) > 0 and
+        delta(after_write.ntfs_metadata_targeted_invalidations, warm_missing.ntfs_metadata_targeted_invalidations) > 0 and
+        delta(after_write.ntfs_metadata_global_mutation_invalidations, warm_missing.ntfs_metadata_global_mutation_invalidations) == 0 and
+        delta(after_write.ntfs_metadata_recovery_invalidations, warm_missing.ntfs_metadata_recovery_invalidations) == 0 and
+        after_write.ntfs_metadata_content_generation == warm_missing.ntfs_metadata_content_generation;
+
+    const appended = ctx.fileAppend(ntfs_metadata_probe_path, append_data_buf[0..]);
+    const after_append = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED post-append snapshot");
+        return false;
+    };
+    const resized_info = ctx.fileInfo(ntfs_metadata_probe_path);
+    const resize_cold = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED resize-cold snapshot");
+        return false;
+    };
+    const resized_info_warm = ctx.fileInfo(ntfs_metadata_probe_path);
+    const resize_warm = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED resize-warm snapshot");
+        return false;
+    };
+    const resized_size = initial_data.len + append_data_buf.len;
+    const resize_invalidation_ok = appended == @as(i32, @intCast(append_data_buf.len)) and
+        resized_info != null and resized_info_warm != null and
+        resized_info.?.size == resized_size and resized_info_warm.?.size == resized_size and
+        delta(after_append.ntfs_metadata_payload_write_retentions, warm_positive.ntfs_metadata_payload_write_retentions) > 0 and
+        delta(after_append.ntfs_metadata_targeted_record_invalidations, warm_positive.ntfs_metadata_targeted_record_invalidations) > 0 and
+        delta(after_append.ntfs_metadata_global_mutation_invalidations, warm_positive.ntfs_metadata_global_mutation_invalidations) == 0 and
+        delta(after_append.ntfs_metadata_recovery_invalidations, warm_positive.ntfs_metadata_recovery_invalidations) == 0 and
+        after_append.ntfs_metadata_content_generation == warm_positive.ntfs_metadata_content_generation and
+        delta(resize_cold.ntfs_metadata_path_misses, after_append.ntfs_metadata_path_misses) > 0 and
+        delta(resize_cold.ntfs_metadata_lookup_tree_walks, after_append.ntfs_metadata_lookup_tree_walks) > 0 and
+        delta(resize_warm.ntfs_metadata_path_positive_hits, resize_cold.ntfs_metadata_path_positive_hits) > 0 and
+        delta(resize_warm.ntfs_metadata_lookup_tree_walks, resize_cold.ntfs_metadata_lookup_tree_walks) == 0;
+
+    var combined: [3072]u8 = undefined;
+    const combined_read = ctx.fileRead(ntfs_metadata_probe_path, combined[0..]);
+    const combined_ok = combined_read == @as(i32, @intCast(combined.len)) and
+        verifyStreamPattern(combined[0..], 0);
+
+    const renamed = ctx.fileRename(ntfs_metadata_probe_path, ntfs_metadata_renamed_path);
+    const after_rename = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED post-rename snapshot");
+        return false;
+    };
+    const old_missing = ctx.fileInfo(ntfs_metadata_probe_path) == null;
+    const renamed_info = ctx.fileInfo(ntfs_metadata_renamed_path);
+    const rename_cold = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED rename-cold snapshot");
+        return false;
+    };
+    const old_missing_warm = ctx.fileInfo(ntfs_metadata_probe_path) == null;
+    const renamed_info_warm = ctx.fileInfo(ntfs_metadata_renamed_path);
+    const rename_warm = dev.performanceSummary() orelse {
+        ctx.println("FSDIAG ntfs metadata cache: FAILED rename-warm snapshot");
+        return false;
+    };
+    const rename_invalidation_ok = renamed > 0 and old_missing and old_missing_warm and
+        renamed_info != null and renamed_info_warm != null and
+        renamed_info.?.size == resized_size and renamed_info_warm.?.size == resized_size and
+        delta(after_rename.ntfs_metadata_targeted_invalidations, resize_warm.ntfs_metadata_targeted_invalidations) > 0 and
+        delta(after_rename.ntfs_metadata_global_mutation_invalidations, resize_warm.ntfs_metadata_global_mutation_invalidations) == 0 and
+        delta(after_rename.ntfs_metadata_recovery_invalidations, resize_warm.ntfs_metadata_recovery_invalidations) == 0 and
+        after_rename.ntfs_metadata_content_generation == resize_warm.ntfs_metadata_content_generation and
+        delta(rename_warm.ntfs_metadata_path_negative_hits, rename_cold.ntfs_metadata_path_negative_hits) > 0 and
+        delta(rename_warm.ntfs_metadata_path_positive_hits, rename_cold.ntfs_metadata_path_positive_hits) > 0 and
+        delta(rename_warm.ntfs_metadata_lookup_tree_walks, rename_cold.ntfs_metadata_lookup_tree_walks) == 0;
+
+    const deleted = ctx.fileDelete(ntfs_metadata_renamed_path);
     const after_delete = dev.performanceSummary() orelse {
         ctx.println("FSDIAG ntfs metadata cache: FAILED post-delete snapshot");
         return false;
     };
-    const missing_after_delete = ctx.fileInfo(ntfs_metadata_probe_path) == null;
+    const missing_after_delete = ctx.fileInfo(ntfs_metadata_renamed_path) == null;
     const cold_after_delete = dev.performanceSummary() orelse {
         ctx.println("FSDIAG ntfs metadata cache: FAILED delete-cold snapshot");
         return false;
     };
-    const missing_after_delete_warm = ctx.fileInfo(ntfs_metadata_probe_path) == null;
+    const missing_after_delete_warm = ctx.fileInfo(ntfs_metadata_renamed_path) == null;
     const warm_after_delete = dev.performanceSummary() orelse {
         ctx.println("FSDIAG ntfs metadata cache: FAILED delete-warm snapshot");
         return false;
     };
     const delete_invalidation_ok = deleted > 0 and
-        delta(after_delete.ntfs_metadata_mutation_invalidations, warm_positive.ntfs_metadata_mutation_invalidations) > 0 and
-        after_delete.ntfs_metadata_content_generation > warm_positive.ntfs_metadata_content_generation and
+        delta(after_delete.ntfs_metadata_targeted_invalidations, rename_warm.ntfs_metadata_targeted_invalidations) > 0 and
+        delta(after_delete.ntfs_metadata_global_mutation_invalidations, rename_warm.ntfs_metadata_global_mutation_invalidations) == 0 and
+        delta(after_delete.ntfs_metadata_recovery_invalidations, rename_warm.ntfs_metadata_recovery_invalidations) == 0 and
+        after_delete.ntfs_metadata_content_generation == rename_warm.ntfs_metadata_content_generation and
         missing_after_delete and
         delta(cold_after_delete.ntfs_metadata_path_misses, after_delete.ntfs_metadata_path_misses) > 0 and
         delta(cold_after_delete.ntfs_metadata_lookup_tree_walks, after_delete.ntfs_metadata_lookup_tree_walks) > 0 and
         missing_after_delete_warm and
         delta(warm_after_delete.ntfs_metadata_path_negative_hits, cold_after_delete.ntfs_metadata_path_negative_hits) > 0 and
         delta(warm_after_delete.ntfs_metadata_lookup_tree_walks, cold_after_delete.ntfs_metadata_lookup_tree_walks) == 0;
-    const create_invalidation_ok =
-        delta(after_write.ntfs_metadata_mutation_invalidations, warm_missing.ntfs_metadata_mutation_invalidations) > 0 and
-        after_write.ntfs_metadata_content_generation > warm_missing.ntfs_metadata_content_generation;
-
     // CONFIG is large enough to own an INDX allocation in the test image.
     // A second unchanged enumeration must therefore reuse a decoded block.
     var index_entry: [128]u8 = .{0} ** 128;
@@ -354,10 +432,26 @@ fn checkNtfsMetadataCache(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev
     const index_warm_hits = delta(after.ntfs_metadata_index_hits, index_cold.ntfs_metadata_index_hits);
     const index_ok = index_cold_rc >= 0 and index_warm_rc >= 0 and index_warm_hits > 0;
     const record_ok = delta(after.ntfs_metadata_record_hits, before.ntfs_metadata_record_hits) > 0;
+    const targeted_delta = delta(after.ntfs_metadata_targeted_invalidations, before.ntfs_metadata_targeted_invalidations);
+    const targeted_parts_delta = delta(after.ntfs_metadata_targeted_record_invalidations, before.ntfs_metadata_targeted_record_invalidations) +%
+        delta(after.ntfs_metadata_targeted_attribute_invalidations, before.ntfs_metadata_targeted_attribute_invalidations) +%
+        delta(after.ntfs_metadata_targeted_directory_invalidations, before.ntfs_metadata_targeted_directory_invalidations);
+    const invalidated_entry_delta = delta(after.ntfs_metadata_mutation_invalidated_record_entries, before.ntfs_metadata_mutation_invalidated_record_entries) +%
+        delta(after.ntfs_metadata_mutation_invalidated_attribute_entries, before.ntfs_metadata_mutation_invalidated_attribute_entries) +%
+        delta(after.ntfs_metadata_mutation_invalidated_index_entries, before.ntfs_metadata_mutation_invalidated_index_entries) +%
+        delta(after.ntfs_metadata_mutation_invalidated_path_entries, before.ntfs_metadata_mutation_invalidated_path_entries);
+    const classification_ok = targeted_delta == targeted_parts_delta and targeted_delta > 0 and
+        delta(after.ntfs_metadata_payload_write_retentions, before.ntfs_metadata_payload_write_retentions) > 0 and
+        delta(after.ntfs_metadata_system_write_retentions, before.ntfs_metadata_system_write_retentions) > 0 and
+        delta(after.ntfs_metadata_global_mutation_invalidations, before.ntfs_metadata_global_mutation_invalidations) == 0 and
+        delta(after.ntfs_metadata_recovery_invalidations, before.ntfs_metadata_recovery_invalidations) == 0 and
+        invalidated_entry_delta > 0 and
+        invalidated_entry_delta <= delta(after.ntfs_metadata_invalidated_entries, before.ntfs_metadata_invalidated_entries);
 
     const ok = capacities_ok and cold_negative_ok and warm_negative_ok and
         create_invalidation_ok and cold_positive_ok and warm_positive_ok and
-        delete_invalidation_ok and index_ok and record_ok;
+        resize_invalidation_ok and combined_ok and rename_invalidation_ok and
+        delete_invalidation_ok and index_ok and record_ok and classification_ok;
     ctx.write("FSDIAG ntfs metadata cache: ");
     ctx.write(if (ok) "OK" else "FAILED");
     ctx.write(" coldMiss=");
@@ -372,8 +466,14 @@ fn checkNtfsMetadataCache(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev
     ctx.printU64(delta(warm_positive.ntfs_metadata_attribute_hits, cold_positive.ntfs_metadata_attribute_hits));
     ctx.write(" indexHit=");
     ctx.printU64(index_warm_hits);
-    ctx.write(" invalidation=");
-    ctx.printU64(delta(after.ntfs_metadata_mutation_invalidations, before.ntfs_metadata_mutation_invalidations));
+    ctx.write(" targeted=");
+    ctx.printU64(targeted_delta);
+    ctx.write(" payloadKeep=");
+    ctx.printU64(delta(after.ntfs_metadata_payload_write_retentions, before.ntfs_metadata_payload_write_retentions));
+    ctx.write(" systemKeep=");
+    ctx.printU64(delta(after.ntfs_metadata_system_write_retentions, before.ntfs_metadata_system_write_retentions));
+    ctx.write(" global=");
+    ctx.printU64(delta(after.ntfs_metadata_global_mutation_invalidations, before.ntfs_metadata_global_mutation_invalidations));
     ctx.write(" generation=");
     ctx.printU64(before.ntfs_metadata_content_generation);
     ctx.write("->");
@@ -385,9 +485,12 @@ fn checkNtfsMetadataCache(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev
     ctx.write(if (create_invalidation_ok) "I" else "i");
     ctx.write(if (cold_positive_ok) "P" else "p");
     ctx.write(if (warm_positive_ok) "H" else "h");
+    ctx.write(if (resize_invalidation_ok and combined_ok) "A" else "a");
+    ctx.write(if (rename_invalidation_ok) "M" else "m");
     ctx.write(if (delete_invalidation_ok) "D" else "d");
     ctx.write(if (index_ok) "X" else "x");
     ctx.write(if (record_ok) "R" else "r");
+    ctx.write(if (classification_ok) "T" else "t");
     ctx.write(" bytes=");
     ctx.printU64(before.ntfs_metadata_cache_bytes_per_volume);
     ctx.write(" slots=");

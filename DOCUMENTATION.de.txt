@@ -16,7 +16,10 @@ FSDIAG prueft den aktuellen R4SYS-Dateisystemvertrag:
   spekulatives Read-ahead sowie zusammenhaengende Mehrseiten-Fills mit rohen Backend-,
   Seiten-, Sektor-, Byte-, Fehler-, Retry-, Kopier- und Lockzaehlern
 - kalte und warme NTFS-Metadatenaufloesung fuer Record-, Attribut-/Runlist-,
-  INDX- sowie positive und negative Pfadcaches mit Mutationsinvalidierung
+  INDX- sowie positive und negative Pfadcaches; Create, Append/Resize,
+  Rename und Delete muessen ihre Identitaeten gezielt invalidieren, waehrend
+  Payload- und MFT-Spiegelwrites den uebrigen Cache behalten und nur
+  Recovery global invalidiert
 
 Der Test verwendet die aktuellen R4SYS-Felder und faellt nicht auf einen
 zweiten Datei-I/O-Pfad zurueck.
@@ -37,6 +40,13 @@ dem Mehrseiten-Demand-Pfad reproduzierbare Subsystemhaenger verursachten. Das
 Testprofil nutzt diesen begrenzten Modus
 als Gastgate; ein normaler Aufruf behaelt die vollstaendige
 Dateisystemdiagnose einschliesslich der grossen FAT32-Proben.
+
+Die NTFS-Probe verwendet einen nichtresidenten Testdatensatz, prueft dessen
+Inhalt nach Append/Resize und schliesst stale positive wie negative Pfade
+nach Rename und Delete aus. PerformanceSummary v14 trennt behaltene
+Payload-/Systemwrites, Record-/Attribut-/Verzeichnisinvalidierungen, globale
+Recovery sowie die vier tatsaechlich entfernten Cacheklassen. Im fehlerfreien
+Gastintervall duerfen weder globale noch Recovery-Invalidierungen auftreten.
 
 Repository-Build
 ----------------
