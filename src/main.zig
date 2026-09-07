@@ -59,6 +59,14 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     var ok = true;
 
     ctx.println("FSDIAG");
+    if (containsIgnoreCase(app.args(), "/NTFS")) {
+        ctx.println("FSDIAG mode: ntfs");
+        ok = checkNtfsMetadataCache(&ctx, &dev) and ok;
+        ok = checkNtfsMove(&ctx, &dev) and ok;
+        ctx.print("FSDIAG result: ");
+        ctx.println(if (ok) "OK" else "FAILED");
+        return if (ok) 0 else 1;
+    }
     if (pagecache_only) {
         ctx.println("FSDIAG mode: pagecache");
         ok = checkStorageOwnership(&ctx, &dev, 'C') and ok;
@@ -97,6 +105,65 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     ctx.print("FSDIAG result: ");
     ctx.println(if (ok) "OK" else "FAILED");
     return if (ok) 0 else 1;
+}
+
+var move_data: [1024 * 1024]u8 = undefined;
+var move_read: [128 * 1024]u8 = undefined;
+
+fn checkNtfsMove(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Context) bool {
+    const source = "C:\\TEMP\\FSMOVE.BIN";
+    const target = "C:\\TEMP\\FSMOVED.BIN";
+    const cross = "D:\\TEMP\\FSMOVE.BIN";
+    _ = ctx.fileDelete(source);
+    _ = ctx.fileDelete(target);
+    _ = ctx.fileDelete(cross);
+    defer {
+        _ = ctx.fileDelete(source);
+        _ = ctx.fileDelete(target);
+        _ = ctx.fileDelete(cross);
+    }
+    fillStreamPattern(&move_data, 0);
+    if (ctx.fileWrite(source, &move_data) != move_data.len) return false;
+    const original = ctx.fileInfo(source) orelse return false;
+    const before = dev.performanceSummary() orelse return false;
+    const moved = ctx.base.fileMove(source, target);
+    const after = dev.performanceSummary() orelse return false;
+    const renamed = ctx.fileInfo(target) orelse return false;
+    const copied = delta(after.fs_cache_read_caller_copy_bytes, before.fs_cache_read_caller_copy_bytes);
+    const metadata_ok = moved > 0 and !ctx.exists(source) and
+        original.first_cluster == renamed.first_cluster and original.size == renamed.size and
+        original.created_time == renamed.created_time and original.created_date == renamed.created_date and
+        copied < move_data.len; // all metadata reads together stay below one payload copy
+    var content_ok = true;
+    var offset: usize = 0;
+    while (offset < move_data.len) : (offset += move_read.len) {
+        const got = ctx.fileReadAt(target, @intCast(offset), &move_read);
+        content_ok = got == move_read.len and memEql(&move_read, move_data[offset..][0..move_read.len]) and content_ok;
+    }
+    const missing_ok = ctx.base.fileMove(source, target) == 0;
+    const self_ok = ctx.base.fileMove(target, target) == -8;
+    // Existing destination retains the prior replacement behavior.
+    const replace_ok = ctx.fileWrite(source, "replacement") == 11 and ctx.base.fileMove(source, target) > 0 and
+        ctx.fileRead(target, move_read[0..11]) == 11 and memEql(move_read[0..11], "replacement");
+    // Cross-volume movement still performs the complete copy before delete.
+    const cross_ok = ctx.base.fileMove(target, cross) > 0 and !ctx.exists(target) and
+        ctx.fileRead(cross, move_read[0..11]) == 11 and memEql(move_read[0..11], "replacement");
+    const ok = metadata_ok and content_ok and missing_ok and self_ok and replace_ok and cross_ok;
+    ctx.write("FSDIAG ntfs move: ");
+    ctx.write(if (ok) "OK" else "FAILED");
+    ctx.write(" readBytes=");
+    ctx.printU64(copied);
+    ctx.write(" payloadBytes=");
+    ctx.printU64(move_data.len);
+    ctx.write(" identity=");
+    ctx.write(if (metadata_ok) "yes" else "no");
+    ctx.write(" content=");
+    ctx.write(if (content_ok) "yes" else "no");
+    ctx.write(" replace=");
+    ctx.write(if (replace_ok) "yes" else "no");
+    ctx.write(" crossVolume=");
+    ctx.println(if (cross_ok) "yes" else "no");
+    return ok;
 }
 
 fn checkFacadeRead(ctx: *const r4os.r4sys.Context, files: *const r4os.Files) bool {
