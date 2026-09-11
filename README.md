@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.7`
+- Version: `0.1.10`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/DIAG/FSDIAG.R4X`
 - Image scope: `test`
 - Canonical project manifest: `module.R4MF`
@@ -32,6 +32,15 @@ mapped local checkouts.
 Detailed German technical notes from the migration are preserved in
 `DOCUMENTATION.de.txt`. Source-transfer provenance is recorded in
 `PROVENANCE.txt`.
+
+`FSDIAG /FATDIR` explicitly checks directory growth on the internal boot FAT.
+It requires an absent `\boot\FGROW079` directory, fills its first cluster,
+performs an atomic replacement needing a new backup entry, then creates and
+enumerates a maximum-length name across cluster boundaries. It verifies
+both FAT mirrors, neighboring contents and complete directory reclamation.
+Existing fixtures are never reused; a failed probe keeps its directory for
+inspection. This mode is separate from the normal diagnostic and needs no
+large files or long performance run.
 
 ## License
 

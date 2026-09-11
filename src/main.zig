@@ -59,6 +59,15 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     var ok = true;
 
     ctx.println("FSDIAG");
+    if (containsIgnoreCase(app.args(), "/FATDIR")) {
+        @import("fat_directory.zig").run(&ctx) catch |err| {
+            ctx.write("FSDIAG fat-directory: FAILED reason=");
+            ctx.println(@errorName(err));
+            return 1;
+        };
+        ctx.println("FSDIAG result: OK");
+        return 0;
+    }
     if (containsIgnoreCase(app.args(), "/NTFS")) {
         ctx.println("FSDIAG mode: ntfs");
         ok = checkNtfsMetadataCache(&ctx, &dev) and ok;

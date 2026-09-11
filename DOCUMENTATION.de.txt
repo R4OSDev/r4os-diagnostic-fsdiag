@@ -24,6 +24,19 @@ FSDIAG prueft den aktuellen R4SYS-Dateisystemvertrag:
 Der Test verwendet die aktuellen R4SYS-Felder und faellt nicht auf einen
 zweiten Datei-I/O-Pfad zurueck.
 
+Seit Modul 0.1.10 prueft der ausdrueckliche Aufruf FSDIAG /FATDIR nur die
+Erweiterung des internen FAT-Bootverzeichnisses. Er benoetigt ein fehlendes
+\boot\FGROW079 und erzeugt darin kleine, eindeutig eigene Dateien. Ein voller
+erster Cluster muss den zusaetzlichen Backupeintrag eines atomaren Tauschs
+aufnehmen koennen. Danach bleiben am Ende zwei freie Slots; ein 255 Zeichen
+langer Name benoetigt weitere 19 Slots, bei 512-Byte-Clustern zwei neue
+Cluster. Vollstaendige Dateisuche, Enumeration, Append, Nachbarinhalte und
+beide FAT-Kopien werden geprueft. Nach Erfolg werden eigene Dateien und das
+Verzeichnis geloescht; alle vier Verzeichniscluster muessen frei sein.
+Fehler behalten das Fixture zur Diagnose. Es gibt keine Raw-Schreibzugriffe,
+keine Wiederverwendung vorhandener Fixtures und keinen impliziten Start
+dieses Modus in den normalen/langen FSDIAG-Proben.
+
 `FSDIAG /PAGECACHE` fuehrt die NTFS-Metadatencacheprobe sowie die bestehende
 1-MB-Stream-, selektive Commit-, Readback-, Abbruch- und
 Pagecache-Policyprobe aus. Nach dem Integritaets-Readback des FAT32-Streams
@@ -60,9 +73,13 @@ Unter Windows:
 
     Build.bat
 
+Unter Linux:
+
+    ./Build.sh
+
 Ergebnis:
 
-    D:\R4OS\Artifacts\Modules\FsDiag\FSDIAG.R4X
+    Artifacts/Modules/FsDiag/FSDIAG.R4X (relativ zum Workspace)
 
 Der Build konsumiert nur die gepinnten SDK-, Contract- und R4STD-Bindings.
 Der fachliche Quellstand und die absichtliche Grenzaenderung stehen in
