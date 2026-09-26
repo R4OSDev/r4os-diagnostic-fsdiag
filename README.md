@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.10`
+- Version: `0.1.11`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/DIAG/FSDIAG.R4X`
 - Image scope: `test`
 - Canonical project manifest: `module.R4MF`
@@ -47,3 +47,17 @@ large files or long performance run.
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+
+`FSDIAG E /PAGECACHE` selects an explicitly attached FAT32 test volume E:
+for the large-stream/writeback and selective-durability checks. The TEMP
+directory must already exist. The pressure fixture needs 512-byte FAT
+clusters; larger clusters take the direct write path and do not create its
+expected dirty payload pages. The storage-owner check needs a separate block
+device whose first mounted letter is E:. Assign the prepared partition
+through R4PART after removing its automatically assigned mount letter and
+freeing E: in the private test image. The extra disk needs a partition table.
+The existing NTFS metadata and cold-read
+probes remain on C:. Managed C: and D: are both NTFS; a missing or non-FAT
+selection fails before creating the large stream. The normal full diagnostic
+still uses its historical D:-FAT fixtures for the other FAT-specific checks.
+No physical drive is chosen automatically.

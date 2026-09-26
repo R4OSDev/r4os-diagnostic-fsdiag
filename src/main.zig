@@ -7,12 +7,9 @@ const append_data = "R4OS fsdiag append probe\r\n";
 const persistent_data_suffix = "R4OS persistent marker\r\n";
 const stream_path = "C:\\TEMP\\FSTREAM.BIN";
 const stream_copy_path = "C:\\TEMP\\FSCOPY.BIN";
-// The FAT32 metric checks (instrumentation, batching, extent cache, FSInfo)
-// run on the FAT32 data disk since 0.60.9: C: is NTFS, D: keeps the FAT32
-// counters meaningful.
-const stream_large_path = "D:\\TEMP\\FSLARGE.BIN";
+// Legacy full-diagnostic FAT fixtures below still use D:. /PAGECACHE
+// uses its explicitly selected FAT drive: managed C: and D: are NTFS.
 const pagecache_multifill_probe_path = "C:\\R4OS\\SUBSYSTEMS\\r4os.snes\\R4SNES.R4X";
-const stream_interleave_path = "D:\\TEMP\\FSINT.BIN";
 const stream_abort_path = "C:\\TEMP\\FSABORT.BIN";
 const qualified_entry_probe_path = "C:\\TEMP\\FSDIREAD.TXT";
 const ntfs_metadata_probe_path = "C:\\TEMP\\NTFSMETA.TST";
@@ -82,7 +79,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         ok = checkStorageOwnership(&ctx, &dev, data_letter) and ok;
         ok = checkDataDrive(&ctx, data_letter) and ok;
         ok = checkNtfsMetadataCache(&ctx, &dev) and ok;
-        ok = checkLargeStreaming(&ctx, &dev) and ok;
+        ok = checkLargeStreaming(&ctx, &dev, data_letter) and ok;
         ctx.print("FSDIAG result: ");
         ctx.println(if (ok) "OK" else "FAILED");
         return if (ok) 0 else 1;
@@ -100,7 +97,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     ok = checkFat32Instrumentation(&ctx, &dev) and ok;
     ok = checkWriteRead(&ctx) and ok;
     ok = checkStreaming(&ctx) and ok;
-    ok = checkLargeStreaming(&ctx, &dev) and ok;
+    ok = checkLargeStreaming(&ctx, &dev, data_letter) and ok;
     ok = checkFat32Synthetic14Mb(&ctx, &dev) and ok;
     ok = checkFat32ReadExtentCache(&ctx, &dev) and ok;
     ok = checkFat32FsInfoInuseMap(&ctx, &dev) and ok;
@@ -964,7 +961,16 @@ fn checkStreaming(ctx: *const r4os.r4sys.Context) bool {
     return ok;
 }
 
-fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Context) bool {
+fn checkLargeStreaming(ctx: *const r4os.r4sys.Context, dev: *const r4os.r4dev.Context, data_letter: u8) bool {
+    const info = ctx.driveInfo(data_letter - 'A');
+    if (info == null or info.?.mounted == 0 or info.?.kind != 2) {
+        ctx.println("FSDIAG stream large result: FAILED requires a mounted FAT32 drive (e.g. FSDIAG E /PAGECACHE)");
+        return false;
+    }
+    var large_buffer: [64]u8 = undefined;
+    var interleave_buffer: [64]u8 = undefined;
+    const stream_large_path = buildPath(&large_buffer, data_letter, "\\TEMP\\FSLARGE.BIN");
+    const stream_interleave_path = buildPath(&interleave_buffer, data_letter, "\\TEMP\\FSINT.BIN");
     if (!dev.hasFn("performance_summary")) {
         ctx.println("FSDIAG stream large result: FAILED missing group-table fn");
         return false;
